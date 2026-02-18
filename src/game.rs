@@ -66,6 +66,14 @@ pub enum GameType {
     AgainstAi,
     ScreenSaver,
     WithFriend,
+    WithNetwork,
+}
+
+/// Which player slot this client controls in a network game
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NetworkPlayer {
+    Player1,
+    Player2,
 }
 
 #[derive(Debug)]

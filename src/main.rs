@@ -19,6 +19,7 @@ use tui_big_text::{BigText, PixelSize};
 mod game;
 mod game_theme;
 mod helpers;
+mod network;
 use crate::{
     game::{Game, GameType, PLAYER_NAME_CHAR_LEN},
     helpers::{centered_rect, centered_rect_with_percentage},
