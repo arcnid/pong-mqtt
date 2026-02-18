@@ -1,5 +1,6 @@
 use std::{
     io::{self},
+    sync::mpsc,
     thread::sleep,
     time::Duration,
 };
@@ -23,6 +24,7 @@ mod network;
 use crate::{
     game::{Game, GameType, PLAYER_NAME_CHAR_LEN},
     helpers::{centered_rect, centered_rect_with_percentage},
+    network::{NetworkConfig, NetworkEvent},
 };
 
 #[derive(Debug)]
@@ -35,6 +37,7 @@ struct MainMenu {
 enum AppScreen {
     MainMenu,
     PlayerNameInput { current: usize, max: usize },
+    NetworkLobby,
     Game,
     Settings,
 }
@@ -54,15 +57,34 @@ struct App {
     default_difficulty_screensaver: f32,
     selected_theme: GameTheme,
     settings_selected: usize, // 0: vs AI, 1: with friend, 2: screensaver, 3: theme, 4: back
+    // Network lobby state
+    network_rx: Option<mpsc::Receiver<NetworkEvent>>,
+    network_paddle_tx: Option<mpsc::SyncSender<u16>>,
+    network_local_player: u8,     // 1 or 2
+    network_game_id: String,      // typed game ID
+    network_player_select: u8,    // lobby: which player slot selected (1 or 2)
+    network_lobby_field: usize,   // 0=game_id, 1=player, 2=connect, 3=back
+    network_last_paddle_y: u16,   // debounce: only publish when changed
+    network_status: NetworkStatus,
 }
 
-const MAIN_MENU_OPTIONS: [&str; 5] = [
+#[derive(Debug, PartialEq)]
+enum NetworkStatus {
+    Idle,
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
+const MAIN_MENU_OPTIONS: [&str; 6] = [
     "Play vs. AI",
     "Play with Friend",
+    "Play Online (MQTT)",
     "I like to watch",
     "Settings",
     "Exit",
 ];
+const MENU_LAST_IDX: usize = MAIN_MENU_OPTIONS.len() - 1;
 
 impl App {
     fn new() -> Self {
@@ -83,6 +105,14 @@ impl App {
             default_difficulty_screensaver: 1.2,
             selected_theme: GameTheme::Monokai,
             settings_selected: 0,
+            network_rx: None,
+            network_paddle_tx: None,
+            network_local_player: 1,
+            network_game_id: String::from("demo"),
+            network_player_select: 1,
+            network_lobby_field: 0,
+            network_last_paddle_y: 0,
+            network_status: NetworkStatus::Idle,
         }
     }
 
@@ -121,20 +151,42 @@ impl App {
                         self.handle_player_name_input_events(current, max)?;
                         let _ = terminal.draw(|frame| self.draw_player_name_input(frame, current));
                     }
-                    AppScreen::Game => match self.current_game.as_mut() {
-                        Some(game) => {
-                            let continue_game = game.game_loop()?;
-                            if !continue_game {
-                                self.current_game = None;
-                                self.screen = AppScreen::MainMenu;
-                            } else {
+                    AppScreen::NetworkLobby => {
+                        self.handle_network_lobby_events()?;
+                        let _ = terminal.draw(|frame| self.draw_network_lobby(frame));
+                    }
+                    AppScreen::Game => {
+                        // Drain MQTT events before the game loop tick
+                        self.drain_network_events();
+
+                        let continue_game = match self.current_game.as_mut() {
+                            Some(game) => game.game_loop()?,
+                            None => false,
+                        };
+
+                        if !continue_game {
+                            self.current_game = None;
+                            self.network_rx = None;
+                            self.network_paddle_tx = None;
+                            self.network_status = NetworkStatus::Idle;
+                            self.screen = AppScreen::MainMenu;
+                        } else {
+                            // Publish our paddle Y if it changed - read first, then borrow ends
+                            let local_idx = self.network_local_player.saturating_sub(1) as usize;
+                            let paddle_y = self.current_game.as_ref().map(|g| g.get_paddle_y(local_idx));
+                            if let Some(y) = paddle_y {
+                                if y != self.network_last_paddle_y {
+                                    self.network_last_paddle_y = y;
+                                    if let Some(tx) = &self.network_paddle_tx {
+                                        tx.try_send(y).ok();
+                                    }
+                                }
+                            }
+                            if let Some(game) = self.current_game.as_mut() {
                                 let _ = terminal.draw(|frame| game.draw(frame));
                             }
                         }
-                        None => {
-                            self.screen = AppScreen::MainMenu;
-                        }
-                    },
+                    }
                     AppScreen::Settings => {
                         self.handle_settings_events()?;
                         let _ = terminal.draw(|frame| self.draw_settings(frame));
@@ -167,7 +219,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints(vec![
                 Constraint::Length(12),
-                Constraint::Length(13),
+                Constraint::Length(16),
                 Constraint::Max(5),
             ])
             .flex(Flex::Center)
@@ -207,7 +259,7 @@ impl App {
             .split(options_block_layout[0]);
 
         let inner_options_layout = options_layout[0].inner(Margin::new(1, 0));
-        let rows_stored = inner_options_layout.height.clamp(5, 15) as usize;
+        let rows_stored = inner_options_layout.height.clamp(7, 20) as usize;
 
         let option_constraints = vec![Constraint::Max(1); rows_stored];
         let option_areas = Layout::vertical(option_constraints)
@@ -272,11 +324,11 @@ impl App {
                             if self.main_menu.selected > 0 {
                                 self.main_menu.selected -= 1;
                             } else {
-                                self.main_menu.selected = 4;
+                                self.main_menu.selected = MENU_LAST_IDX;
                             }
                         }
                         KeyCode::Down => {
-                            if self.main_menu.selected < 4 {
+                            if self.main_menu.selected < MENU_LAST_IDX {
                                 self.main_menu.selected += 1;
                             } else {
                                 self.main_menu.selected = 0;
@@ -297,6 +349,13 @@ impl App {
                                     self.screen = AppScreen::PlayerNameInput { current: 0, max: 1 };
                                 }
                                 2 => {
+                                    // Play Online
+                                    self.network_lobby_field = 0;
+                                    self.network_game_id = String::from("demo");
+                                    self.network_player_select = 1;
+                                    self.screen = AppScreen::NetworkLobby;
+                                }
+                                3 => {
                                     // I like to watch
                                     let mut game = Game::new(
                                         ["Forg", "Car"],
@@ -308,12 +367,12 @@ impl App {
                                     self.current_game = Some(game);
                                     self.screen = AppScreen::Game;
                                 }
-                                3 => {
+                                4 => {
                                     // Settings
                                     self.settings_selected = 0;
                                     self.screen = AppScreen::Settings;
                                 }
-                                4 => {
+                                5 => {
                                     self.exit();
                                 }
                                 _ => {}
@@ -620,6 +679,192 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Network lobby
+    // -----------------------------------------------------------------------
+
+    fn draw_network_lobby(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let popup_area = centered_rect_with_percentage(50, 40, area.width, area.height);
+
+        let status_label = match self.network_status {
+            NetworkStatus::Idle => "Ready",
+            NetworkStatus::Connecting => "Connecting...",
+            NetworkStatus::Connected => "Connected",
+            NetworkStatus::Disconnected => "Disconnected - try again",
+        };
+
+        let field_labels = [
+            format!(
+                "Game ID: {}{}",
+                self.network_game_id,
+                if self.network_lobby_field == 0 { "_" } else { " " }
+            ),
+            format!("Player:  {}", self.network_player_select),
+            "[ Connect ]".to_string(),
+            "[ Back    ]".to_string(),
+        ];
+
+        let mut lines = vec![
+            format!(" Status: {}\n", status_label),
+            String::new(),
+        ];
+        for (i, label) in field_labels.iter().enumerate() {
+            if i == self.network_lobby_field {
+                lines.push(format!(" > {} <\n", label));
+            } else {
+                lines.push(format!("   {}\n", label));
+            }
+        }
+        lines.push(String::new());
+        lines.push(String::from(
+            " Tab/↑↓ navigate  ←/→ toggle player  Enter confirm  Esc back",
+        ));
+
+        let popup = Paragraph::new(lines.concat())
+            .block(
+                Block::default()
+                    .title(" Play Online ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .style(Style::default().fg(Color::Cyan)),
+            )
+            .style(Style::default().fg(Color::Green))
+            .alignment(Alignment::Left);
+        frame.render_widget(popup, popup_area);
+    }
+
+    fn handle_network_lobby_events(&mut self) -> io::Result<()> {
+        if event::poll(Duration::from_millis(10))? {
+            match event::read()? {
+                Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                    match key_event.code {
+                        KeyCode::Esc => {
+                            self.screen = AppScreen::MainMenu;
+                        }
+                        KeyCode::Tab | KeyCode::Down => {
+                            self.network_lobby_field = (self.network_lobby_field + 1) % 4;
+                        }
+                        KeyCode::Up => {
+                            if self.network_lobby_field == 0 {
+                                self.network_lobby_field = 3;
+                            } else {
+                                self.network_lobby_field -= 1;
+                            }
+                        }
+                        KeyCode::Left | KeyCode::Right => {
+                            if self.network_lobby_field == 1 {
+                                self.network_player_select = if self.network_player_select == 1 { 2 } else { 1 };
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if self.network_lobby_field == 0 {
+                                self.network_game_id.pop();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if self.network_lobby_field == 0 {
+                                if self.network_game_id.len() < 20 && c.is_ascii_alphanumeric() {
+                                    self.network_game_id.push(c);
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            match self.network_lobby_field {
+                                3 => {
+                                    // Back
+                                    self.screen = AppScreen::MainMenu;
+                                }
+                                2 | _ => {
+                                    // Connect
+                                    self.launch_network_game();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_network_game(&mut self) {
+        let game_id = if self.network_game_id.trim().is_empty() {
+            "demo".to_string()
+        } else {
+            self.network_game_id.trim().to_string()
+        };
+
+        self.network_local_player = self.network_player_select;
+        self.network_status = NetworkStatus::Connecting;
+
+        let config = NetworkConfig {
+            game_id: game_id.clone(),
+            player: self.network_local_player,
+            ..NetworkConfig::default()
+        };
+
+        let handle = network::connect(config);
+        self.network_rx = Some(handle.rx);
+        self.network_paddle_tx = Some(handle.paddle_tx);
+
+        let p1_name = if self.network_local_player == 1 { "You" } else { "Opponent" };
+        let p2_name = if self.network_local_player == 2 { "You" } else { "Opponent" };
+
+        let mut game = Game::new(
+            [p1_name, p2_name],
+            Rect::default(),
+            GameType::WithNetwork,
+            Some(1.0),
+        );
+        game.set_theme(self.selected_theme);
+        self.current_game = Some(game);
+        self.screen = AppScreen::Game;
+    }
+
+    // -----------------------------------------------------------------------
+    // Network event processing (called each frame while in Game screen)
+    // -----------------------------------------------------------------------
+
+    fn drain_network_events(&mut self) {
+        let local = self.network_local_player;
+        let opponent_idx = if local == 1 { 1 } else { 0 };
+
+        if let Some(rx) = &self.network_rx {
+            // drain all pending events without blocking
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => match event {
+                        NetworkEvent::Connected => {
+                            self.network_status = NetworkStatus::Connected;
+                        }
+                        NetworkEvent::Disconnected => {
+                            self.network_status = NetworkStatus::Disconnected;
+                        }
+                        NetworkEvent::OpponentPaddle(y) => {
+                            if let Some(game) = &mut self.current_game {
+                                game.set_opponent_paddle(opponent_idx, y);
+                            }
+                        }
+                        NetworkEvent::BallUpdate(b) => {
+                            if let Some(game) = &mut self.current_game {
+                                game.set_ball_from_network(b.x, b.y, b.vx, b.vy);
+                            }
+                        }
+                        NetworkEvent::StateUpdate(s) => {
+                            if let Some(game) = &mut self.current_game {
+                                game.set_scores(s.p1_score, s.p2_score);
+                            }
+                        }
+                    },
+                    Err(_) => break, // channel empty or closed
+                }
+            }
+        }
     }
 
     fn exit(&mut self) {

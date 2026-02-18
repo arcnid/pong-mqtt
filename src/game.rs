@@ -69,12 +69,6 @@ pub enum GameType {
     WithNetwork,
 }
 
-/// Which player slot this client controls in a network game
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum NetworkPlayer {
-    Player1,
-    Player2,
-}
 
 #[derive(Debug)]
 pub struct Game {
@@ -93,6 +87,30 @@ pub struct Game {
 impl Game {
     pub fn set_theme(&mut self, theme: GameTheme) {
         self.theme = theme;
+    }
+
+    /// Drive the opponent's paddle directly from a network event
+    pub fn set_opponent_paddle(&mut self, player_index: usize, y: u16) {
+        let inner_height = self.game_area.height.saturating_sub(2);
+        let max_y = inner_height.saturating_sub(self.players[player_index].bar_length as u16);
+        self.players[player_index].bar_position = y.min(max_y);
+    }
+
+    /// Set ball position + velocity from the authoritative server
+    pub fn set_ball_from_network(&mut self, x: u16, y: u16, vx: i8, vy: i8) {
+        self.ball.position = [x, y];
+        self.ball.velocity = [vx, vy];
+    }
+
+    /// Overwrite scores from the server state message
+    pub fn set_scores(&mut self, p1: u32, p2: u32) {
+        self.players[0].score = p1;
+        self.players[1].score = p2;
+    }
+
+    /// Read back the local paddle Y so we can publish it to MQTT
+    pub fn get_paddle_y(&self, player_index: usize) -> u16 {
+        self.players[player_index].bar_position
     }
 }
 
@@ -728,18 +746,23 @@ impl Game {
             if self.should_exit {
                 return Ok(false);
             }
-            if self.game_type == GameType::AgainstAi {
-                self.update_computer_player(1);
-            } else {
-                if rand::random() {
-                    self.update_computer_player(0);
+
+            // In network mode the server owns ball physics and opponent paddle.
+            // We only handle local keyboard input (already done above).
+            if self.game_type != GameType::WithNetwork {
+                if self.game_type == GameType::AgainstAi {
                     self.update_computer_player(1);
                 } else {
-                    self.update_computer_player(1);
-                    self.update_computer_player(0);
+                    if rand::random() {
+                        self.update_computer_player(0);
+                        self.update_computer_player(1);
+                    } else {
+                        self.update_computer_player(1);
+                        self.update_computer_player(0);
+                    }
                 }
+                let _ = self.update_ball_position();
             }
-            let _ = self.update_ball_position();
 
             self.last_update = Instant::now();
         }
