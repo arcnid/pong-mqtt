@@ -6,7 +6,7 @@ use std::{
 };
 
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
@@ -234,48 +234,36 @@ impl Game {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        match key_event.code {
-            KeyCode::Esc => self.should_exit = true,
-            KeyCode::Char('q') => self.should_exit = true,
+        let code = key_event.code;
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.should_exit = true,
             KeyCode::Char('p') => {
-                // No pause in network mode - server keeps running
                 if self.game_type != GameType::WithNetwork {
                     self.toggle_pause();
                 }
             }
-            // Player 1 controls (index 0) - only active if local or we ARE player 1
-            KeyCode::Char('/') => {
-                if self.local_player_index != Some(1) {
-                    self.power_move(0);
+            _ => {
+                if let Some(local_idx) = self.local_player_index {
+                    // Network mode: Up/W move local paddle up, Down/S move it down.
+                    // Both key sets work so either hand feels natural.
+                    match code {
+                        KeyCode::Up | KeyCode::Char('w') => self.move_player(local_idx, 1),
+                        KeyCode::Down | KeyCode::Char('s') => self.move_player(local_idx, -1),
+                        _ => {}
+                    }
+                } else {
+                    // Local / screensaver mode: original two-player bindings
+                    match code {
+                        KeyCode::Char('/') => self.power_move(0),
+                        KeyCode::Up => self.move_player(0, 1),
+                        KeyCode::Down => self.move_player(0, -1),
+                        KeyCode::Char(' ') => self.power_move(1),
+                        KeyCode::Char('w') => self.move_player(1, 1),
+                        KeyCode::Char('s') => self.move_player(1, -1),
+                        _ => {}
+                    }
                 }
             }
-            KeyCode::Up => {
-                if self.local_player_index != Some(1) {
-                    self.move_player(0, 1);
-                }
-            }
-            KeyCode::Down => {
-                if self.local_player_index != Some(1) {
-                    self.move_player(0, -1);
-                }
-            }
-            // Player 2 controls (index 1) - only active if local or we ARE player 2
-            KeyCode::Char(' ') => {
-                if self.local_player_index != Some(0) {
-                    self.power_move(1);
-                }
-            }
-            KeyCode::Char('w') => {
-                if self.local_player_index != Some(0) {
-                    self.move_player(1, 1);
-                }
-            }
-            KeyCode::Char('s') => {
-                if self.local_player_index != Some(0) {
-                    self.move_player(1, -1);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -665,20 +653,13 @@ impl Game {
         let area = frame.area();
         let colors = self.theme.colors();
 
-        let main_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(vec![Constraint::Length(130)])
-            .flex(Flex::Center)
-            .split(area);
-
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints(vec![
-                Constraint::Length(28), // game block
-                Constraint::Length(3),  // controls block
+                Constraint::Fill(1),   // game block - fills available space
+                Constraint::Length(3), // controls block
             ])
-            .flex(Flex::Center)
-            .split(main_layout[0]);
+            .split(area);
 
         let game_area = layout[0];
         self.set_area(game_area);
@@ -695,8 +676,8 @@ impl Game {
         self.draw_core_elements(frame);
 
         let controls_text = match self.local_player_index {
-            Some(0) => " You are Player 1  |  ↑/↓ to move  |  Esc = Quit ",
-            Some(1) => " You are Player 2  |  W/S to move  |  Esc = Quit ",
+            Some(0) => " You are Player 1  |  ↑ / W = up    ↓ / S = down  |  Esc = Quit ",
+            Some(1) => " You are Player 2  |  ↑ / W = up    ↓ / S = down  |  Esc = Quit ",
             _ => " Player 1: ↑/↓  |  Player 2: W/S  |  P=Pause  |  Esc=Quit ",
         };
         let controls = Paragraph::new(controls_text)
@@ -799,26 +780,30 @@ impl Game {
 
     fn get_block_title(&self, app_name: &'static str) -> String {
         let player1 = self.get_player(0);
-        let mut player_text = player1.name.iter().collect::<String>();
-        player_text += &format!("({})", player1.score);
+        let p1_text = format!(
+            "{} ({})",
+            player1.name.iter().collect::<String>().trim_end().to_string(),
+            player1.score
+        );
 
         let player2 = self.get_player(1);
-        let mut computer_text = player2.name.iter().collect::<String>();
-        computer_text += &format!("({})", player2.score);
+        let p2_text = format!(
+            "({}) {}",
+            player2.score,
+            player2.name.iter().collect::<String>().trim_start().to_string()
+        );
 
-        let padding_left: u16 = 32;
-        let padding_right: u16 = 32;
-
-        let total_padding = padding_left + padding_right + app_name.len() as u16;
-        let available_space = 130 - total_padding;
+        let used = p1_text.len() + app_name.len() + p2_text.len() + 6; // spaces + separators
+        let total_width = self.game_area.width as usize;
+        let dashes = total_width.saturating_sub(used) / 2;
 
         format!(
             " {} {} {} {} {} ",
-            player_text.trim_end(),
-            "─".repeat((available_space / 2) as usize),
-            app_name.trim_end(),
-            "─".repeat((available_space / 2) as usize),
-            computer_text.trim_start(),
+            p1_text,
+            "─".repeat(dashes),
+            app_name,
+            "─".repeat(dashes),
+            p2_text,
         )
     }
 }

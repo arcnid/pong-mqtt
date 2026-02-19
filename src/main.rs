@@ -23,7 +23,7 @@ mod helpers;
 mod network;
 use crate::{
     game::{Game, GameType},
-    helpers::{centered_rect, centered_rect_with_percentage},
+    helpers::centered_rect_with_percentage,
     network::{NetworkConfig, NetworkEvent},
 };
 
@@ -101,8 +101,8 @@ impl App {
         let mut last_size: u8 = 0; // 0 -> too small | 1 -> normal
 
         while !self.exit {
-            let min_width = 130;
-            let min_height = 28;
+            let min_width = 60;
+            let min_height = 20;
 
             let size = terminal.size()?;
             if size.width < min_width || size.height < min_height {
@@ -115,11 +115,6 @@ impl App {
             } else {
                 if last_size == 0 {
                     sleep(Duration::from_millis(100));
-                    let game_area = centered_rect(130, 28, size.width, size.height);
-                    match self.current_game.as_mut() {
-                        Some(game) => game.set_area(game_area),
-                        None => {}
-                    }
                     last_size = 1;
                 }
 
