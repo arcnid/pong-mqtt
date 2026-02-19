@@ -63,9 +63,7 @@ struct Ball {
 
 #[derive(Debug, PartialEq)]
 pub enum GameType {
-    AgainstAi,
     ScreenSaver,
-    WithFriend,
     WithNetwork,
 }
 
@@ -82,11 +80,19 @@ pub struct Game {
     difficulty: f32,
     should_exit: bool,
     theme: GameTheme,
+    /// For network games: which player index (0 or 1) this client controls.
+    /// None means local (both paddles controlled locally).
+    local_player_index: Option<usize>,
 }
 
 impl Game {
     pub fn set_theme(&mut self, theme: GameTheme) {
         self.theme = theme;
+    }
+
+    /// Set which player index (0-based) this client controls in a network game
+    pub fn set_local_player_index(&mut self, index: usize) {
+        self.local_player_index = Some(index);
     }
 
     /// Drive the opponent's paddle directly from a network event
@@ -156,7 +162,7 @@ impl Game {
             bar_position: (game_area.height / 2).saturating_sub((DEFAULT_BAR_LENGTH / 2) as u16),
             bar_length: DEFAULT_BAR_LENGTH,
             is_computer: false,
-            computer_ai: if game_type == GameType::AgainstAi || game_type == GameType::ScreenSaver {
+            computer_ai: if game_type == GameType::ScreenSaver {
                 Some(ai_player.clone())
             } else {
                 None
@@ -184,6 +190,7 @@ impl Game {
             difficulty: final_difficulty,
             should_exit: false,
             theme,
+            local_player_index: None,
         }
     }
 
@@ -230,15 +237,44 @@ impl Game {
         match key_event.code {
             KeyCode::Esc => self.should_exit = true,
             KeyCode::Char('q') => self.should_exit = true,
-            KeyCode::Char('p') => self.toggle_pause(),
-            // player 1
-            KeyCode::Char('/') => self.power_move(0),
-            KeyCode::Up => self.move_player(0, 1),
-            KeyCode::Down => self.move_player(0, -1),
-            // player 2
-            KeyCode::Char(' ') => self.power_move(1),
-            KeyCode::Char('w') => self.move_player(1, 1),
-            KeyCode::Char('s') => self.move_player(1, -1),
+            KeyCode::Char('p') => {
+                // No pause in network mode - server keeps running
+                if self.game_type != GameType::WithNetwork {
+                    self.toggle_pause();
+                }
+            }
+            // Player 1 controls (index 0) - only active if local or we ARE player 1
+            KeyCode::Char('/') => {
+                if self.local_player_index != Some(1) {
+                    self.power_move(0);
+                }
+            }
+            KeyCode::Up => {
+                if self.local_player_index != Some(1) {
+                    self.move_player(0, 1);
+                }
+            }
+            KeyCode::Down => {
+                if self.local_player_index != Some(1) {
+                    self.move_player(0, -1);
+                }
+            }
+            // Player 2 controls (index 1) - only active if local or we ARE player 2
+            KeyCode::Char(' ') => {
+                if self.local_player_index != Some(0) {
+                    self.power_move(1);
+                }
+            }
+            KeyCode::Char('w') => {
+                if self.local_player_index != Some(0) {
+                    self.move_player(1, 1);
+                }
+            }
+            KeyCode::Char('s') => {
+                if self.local_player_index != Some(0) {
+                    self.move_player(1, -1);
+                }
+            }
             _ => {}
         }
     }
@@ -501,23 +537,13 @@ impl Game {
 
         // add some jitter and behavioral quirks
         let jitter = match self.game_type {
-            GameType::ScreenSaver => (random::<f32>() - 0.5) * 0.02 * (1.0 + ai.fatigue), // much less jitter
-            GameType::AgainstAi => (random::<f32>() - 0.5) * 0.1 * (1.0 + ai.fatigue),
+            GameType::ScreenSaver => (random::<f32>() - 0.5) * 0.02 * (1.0 + ai.fatigue),
             _ => 0.0,
         };
         let movement = distance_to_target.signum() * ai.current_speed + jitter;
 
         let final_movement = match self.game_type {
-            GameType::ScreenSaver => movement, // no hesitation/overshoot in screensaver
-            GameType::AgainstAi => {
-                if random::<f32>() < 0.01 + ai.fatigue * 0.02 {
-                    movement * 0.3 // less hesitation
-                } else if random::<f32>() < 0.015 {
-                    movement * 1.2 // less overshoot
-                } else {
-                    movement
-                }
-            }
+            GameType::ScreenSaver => movement,
             _ => movement,
         };
 
@@ -668,7 +694,11 @@ impl Game {
 
         self.draw_core_elements(frame);
 
-        let controls_text = " Player 1: ↑/↓ or mouse wheel, '/'=Power    |    Player 2: W/S, Space=Power    |    P=Pause    |    Esc=Quit ";
+        let controls_text = match self.local_player_index {
+            Some(0) => " You are Player 1  |  ↑/↓ to move  |  Esc = Quit ",
+            Some(1) => " You are Player 2  |  W/S to move  |  Esc = Quit ",
+            _ => " Player 1: ↑/↓  |  Player 2: W/S  |  P=Pause  |  Esc=Quit ",
+        };
         let controls = Paragraph::new(controls_text)
             .block(
                 Block::default()
@@ -750,16 +780,13 @@ impl Game {
             // In network mode the server owns ball physics and opponent paddle.
             // We only handle local keyboard input (already done above).
             if self.game_type != GameType::WithNetwork {
-                if self.game_type == GameType::AgainstAi {
+                // ScreenSaver: both paddles are AI
+                if rand::random() {
+                    self.update_computer_player(0);
                     self.update_computer_player(1);
                 } else {
-                    if rand::random() {
-                        self.update_computer_player(0);
-                        self.update_computer_player(1);
-                    } else {
-                        self.update_computer_player(1);
-                        self.update_computer_player(0);
-                    }
+                    self.update_computer_player(1);
+                    self.update_computer_player(0);
                 }
                 let _ = self.update_ball_position();
             }
