@@ -2,7 +2,7 @@ use std::{
     io::{self},
     sync::mpsc,
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -50,13 +50,15 @@ struct App {
     selected_theme: GameTheme,
     // Network lobby state
     network_rx: Option<mpsc::Receiver<NetworkEvent>>,
-    network_paddle_tx: Option<mpsc::SyncSender<u16>>,
+    network_paddle_tx: Option<mpsc::SyncSender<f32>>,
     network_local_player: u8,     // 1 or 2
     network_game_id: String,      // typed game ID
     network_player_select: u8,    // lobby: which player slot selected (1 or 2)
     network_lobby_field: usize,   // 0=game_id, 1=player, 2=connect, 3=back
-    network_last_paddle_y: u16,   // debounce: only publish when changed
+    network_last_paddle_y: f32,   // debounce: only publish when changed (physics units)
     network_status: NetworkStatus,
+    network_serve_tx: Option<mpsc::SyncSender<()>>,
+    network_restart_tx: Option<mpsc::SyncSender<()>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -92,8 +94,10 @@ impl App {
             network_game_id: String::from("demo"),
             network_player_select: 1,
             network_lobby_field: 0,
-            network_last_paddle_y: 0,
+            network_last_paddle_y: -1.0,
             network_status: NetworkStatus::Idle,
+            network_serve_tx: None,
+            network_restart_tx: None,
         }
     }
 
@@ -128,6 +132,8 @@ impl App {
                         let _ = terminal.draw(|frame| self.draw_network_lobby(frame));
                     }
                     AppScreen::Game => {
+                        let frame_start = Instant::now();
+
                         // Drain MQTT events before the game loop tick
                         self.drain_network_events();
 
@@ -140,14 +146,27 @@ impl App {
                             self.current_game = None;
                             self.network_rx = None;
                             self.network_paddle_tx = None;
+                            self.network_serve_tx = None;
+                            self.network_restart_tx = None;
                             self.network_status = NetworkStatus::Idle;
                             self.screen = AppScreen::MainMenu;
                         } else {
-                            // Publish our paddle Y if it changed - read first, then borrow ends
+                            // Check if player wants to serve
+                            let wants_serve = self.current_game.as_ref().map(|g| g.pending_serve).unwrap_or(false);
+                            if wants_serve {
+                                if let Some(game) = self.current_game.as_mut() {
+                                    game.pending_serve = false;
+                                }
+                                if let Some(tx) = &self.network_serve_tx {
+                                    tx.try_send(()).ok();
+                                }
+                            }
+
+                            // Publish our paddle Y (physics units) if it changed
                             let local_idx = self.network_local_player.saturating_sub(1) as usize;
-                            let paddle_y = self.current_game.as_ref().map(|g| g.get_paddle_y(local_idx));
+                            let paddle_y = self.current_game.as_ref().map(|g| g.get_paddle_physics_y(local_idx));
                             if let Some(y) = paddle_y {
-                                if y != self.network_last_paddle_y {
+                                if (y - self.network_last_paddle_y).abs() > 0.01 {
                                     self.network_last_paddle_y = y;
                                     if let Some(tx) = &self.network_paddle_tx {
                                         tx.try_send(y).ok();
@@ -156,6 +175,14 @@ impl App {
                             }
                             if let Some(game) = self.current_game.as_mut() {
                                 let _ = terminal.draw(|frame| game.draw(frame));
+                            }
+
+                            // Cap the render loop at ~60fps so the terminal isn't flooded
+                            // with escape sequences and causes tearing / ghost artifacts.
+                            const FRAME_TARGET: Duration = Duration::from_millis(16);
+                            let elapsed = frame_start.elapsed();
+                            if elapsed < FRAME_TARGET {
+                                sleep(FRAME_TARGET - elapsed);
                             }
                         }
                     }
@@ -432,6 +459,8 @@ impl App {
         let handle = network::connect(config);
         self.network_rx = Some(handle.rx);
         self.network_paddle_tx = Some(handle.paddle_tx);
+        self.network_serve_tx = Some(handle.serve_tx);
+        self.network_restart_tx = Some(handle.restart_tx);
 
         let p1_name = if self.network_local_player == 1 { "You" } else { "Opponent" };
         let p2_name = if self.network_local_player == 2 { "You" } else { "Opponent" };
@@ -474,12 +503,20 @@ impl App {
                         }
                         NetworkEvent::BallUpdate(b) => {
                             if let Some(game) = &mut self.current_game {
-                                game.set_ball_from_network(b.x, b.y, b.vx, b.vy);
+                                game.set_ball_from_network(b.x, b.y, b.dx, b.dy);
                             }
                         }
                         NetworkEvent::StateUpdate(s) => {
                             if let Some(game) = &mut self.current_game {
                                 game.set_scores(s.p1_score, s.p2_score);
+                            }
+                            // If the server says the game is ended (stale session),
+                            // immediately request a restart so the game resets
+                            // without waiting for the 30s server cleanup timeout.
+                            if s.status == network::GameStatus::Ended {
+                                if let Some(tx) = &self.network_restart_tx {
+                                    tx.try_send(()).ok();
+                                }
                             }
                         }
                     },

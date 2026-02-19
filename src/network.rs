@@ -9,29 +9,33 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// Sent by each client → server: "my paddle is at this Y position"
+/// y is in physics/court units (0..COURT_HEIGHT), matching the server's coordinate space.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PaddleMsg {
-    pub y: u16,
-    pub timestamp_ms: u64,
+    pub y: f32,
+    pub timestamp: u64,
 }
 
 /// Sent by server → clients: authoritative ball position + velocity
+/// Field names match the TypeScript server exactly (camelCase/snake_case as published).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BallMsg {
-    pub x: u16,
-    pub y: u16,
-    pub vx: i8,
-    pub vy: i8,
-    pub timestamp_ms: u64,
+    pub x: f32,
+    pub y: f32,
+    pub dx: f32,
+    pub dy: f32,
+    pub timestamp: u64,
 }
 
 /// Sent by server → clients: scores and game lifecycle
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StateMsg {
+    #[serde(rename = "p1Score")]
     pub p1_score: u32,
+    #[serde(rename = "p2Score")]
     pub p2_score: u32,
     pub status: GameStatus,
-    pub timestamp_ms: u64,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -39,15 +43,14 @@ pub struct StateMsg {
 pub enum GameStatus {
     Waiting,
     Playing,
-    Scored,
-    GameOver,
+    Ended,
 }
 
 /// Join notification sent by client → server on connect
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JoinMsg {
     pub player: u8, // 1 or 2
-    pub timestamp_ms: u64,
+    pub timestamp: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +87,14 @@ impl Topics {
     pub fn join(&self) -> String {
         format!("pong/game/{}/join", self.game_id)
     }
+
+    pub fn serve(&self) -> String {
+        format!("pong/game/{}/serve", self.game_id)
+    }
+
+    pub fn restart(&self) -> String {
+        format!("pong/game/{}/restart", self.game_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,8 +103,8 @@ impl Topics {
 
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
-    /// Opponent paddle moved to this Y
-    OpponentPaddle(u16),
+    /// Opponent paddle moved to this Y (physics/court units)
+    OpponentPaddle(f32),
     /// Server published authoritative ball state
     BallUpdate(BallMsg),
     /// Server published scores / status
@@ -137,8 +148,12 @@ impl Default for NetworkConfig {
 pub struct NetworkHandle {
     /// Game loop reads events from here
     pub rx: mpsc::Receiver<NetworkEvent>,
-    /// Game loop sends its own paddle Y here to be published
-    pub paddle_tx: mpsc::SyncSender<u16>,
+    /// Game loop sends its own paddle Y (physics units) here to be published
+    pub paddle_tx: mpsc::SyncSender<f32>,
+    /// Game loop sends () here to publish a serve message
+    pub serve_tx: mpsc::SyncSender<()>,
+    /// Game loop sends () here to publish a restart message (ignored unless game is ended)
+    pub restart_tx: mpsc::SyncSender<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +162,9 @@ pub struct NetworkHandle {
 
 pub fn connect(config: NetworkConfig) -> NetworkHandle {
     let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>();
-    let (paddle_tx, paddle_rx) = mpsc::sync_channel::<u16>(32);
+    let (paddle_tx, paddle_rx) = mpsc::sync_channel::<f32>(32);
+    let (serve_tx, serve_rx) = mpsc::sync_channel::<()>(4);
+    let (restart_tx, restart_rx) = mpsc::sync_channel::<()>(4);
 
     thread::spawn(move || {
         let topics = Topics::new(&config.game_id);
@@ -182,24 +199,60 @@ pub fn connect(config: NetworkConfig) -> NetworkHandle {
         // Announce join
         let join_payload = serde_json::to_vec(&JoinMsg {
             player: config.player,
-            timestamp_ms: now_ms(),
+            timestamp: now_ms(),
         })
         .unwrap_or_default();
         client.publish(topics.join(), QoS::AtMostOnce, false, join_payload).ok();
 
-        // Spawn a sub-thread to forward outgoing paddle positions
+        // Send a restart request immediately after join.
+        // If the game is in 'ended' state (stale session on server), this resets it.
+        // If the game is 'waiting' or 'playing', the server ignores it.
+        #[derive(serde::Serialize)]
+        struct RestartMsg { timestamp: u64 }
+        if let Ok(payload) = serde_json::to_vec(&RestartMsg { timestamp: now_ms() }) {
+            client.publish(topics.restart(), QoS::AtMostOnce, false, payload).ok();
+        }
+
+        // Spawn a sub-thread to forward outgoing paddle positions (physics units)
         let publish_client = client.clone();
         let my_paddle_topic = my_paddle.clone();
         thread::spawn(move || {
             while let Ok(y) = paddle_rx.recv() {
                 let msg = PaddleMsg {
                     y,
-                    timestamp_ms: now_ms(),
+                    timestamp: now_ms(),
                 };
                 if let Ok(payload) = serde_json::to_vec(&msg) {
                     publish_client
-                        .publish(&my_paddle_topic, QoS::AtMostOnce, false, payload)
+                        .publish(&my_paddle_topic, QoS::AtMostOnce, true, payload)
                         .ok();
+                }
+            }
+        });
+
+        // Spawn a sub-thread to forward serve signals
+        let serve_client = client.clone();
+        let serve_topic = topics.serve();
+        let player_num = config.player;
+        thread::spawn(move || {
+            while let Ok(()) = serve_rx.recv() {
+                #[derive(serde::Serialize)]
+                struct ServeMsg { player: u8, timestamp: u64 }
+                if let Ok(payload) = serde_json::to_vec(&ServeMsg { player: player_num, timestamp: now_ms() }) {
+                    serve_client.publish(&serve_topic, QoS::AtMostOnce, false, payload).ok();
+                }
+            }
+        });
+
+        // Spawn a sub-thread to forward restart signals
+        let restart_client = client.clone();
+        let restart_topic = topics.restart();
+        thread::spawn(move || {
+            while let Ok(()) = restart_rx.recv() {
+                #[derive(serde::Serialize)]
+                struct RestartMsg2 { timestamp: u64 }
+                if let Ok(payload) = serde_json::to_vec(&RestartMsg2 { timestamp: now_ms() }) {
+                    restart_client.publish(&restart_topic, QoS::AtMostOnce, false, payload).ok();
                 }
             }
         });
@@ -215,7 +268,7 @@ pub fn connect(config: NetworkConfig) -> NetworkHandle {
 
                     if *t == opponent_paddle {
                         if let Ok(p) = serde_json::from_slice::<PaddleMsg>(&msg.payload) {
-                            event_tx.send(NetworkEvent::OpponentPaddle(p.y)).ok();
+                            event_tx.send(NetworkEvent::OpponentPaddle(p.y as f32)).ok();
                         }
                     } else if *t == topics.ball() {
                         if let Ok(b) = serde_json::from_slice::<BallMsg>(&msg.payload) {
@@ -239,6 +292,8 @@ pub fn connect(config: NetworkConfig) -> NetworkHandle {
     NetworkHandle {
         rx: event_rx,
         paddle_tx,
+        serve_tx,
+        restart_tx,
     }
 }
 

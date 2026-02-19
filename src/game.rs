@@ -8,7 +8,7 @@ use std::{
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -24,6 +24,12 @@ const DEFAULT_BALL_VELOCITY_Y: i8 = 1;
 const DEFAULT_PADDLE_WIDTH: u16 = 3;
 const STARTING_POWER_MOVES: u8 = 10;
 const DEFAULT_DIFFICULTY: f32 = 1.0;
+
+/// Physics space dimensions matching the server's GAME_CONSTANTS.
+/// All network ball/paddle coordinates are in this space.
+pub const COURT_WIDTH: f32 = 40.0;
+pub const COURT_HEIGHT: f32 = 12.0;
+pub const COURT_PADDLE_HEIGHT: f32 = 3.0;
 
 #[derive(Debug, Clone, Copy)]
 struct ComputerAI {
@@ -59,6 +65,15 @@ struct Ball {
     position: [u16; 2],
     velocity: [i8; 2],
     is_powered: bool,
+    /// Server-authoritative position in physics/court units (WithNetwork mode only)
+    net_x: f32,
+    net_y: f32,
+    /// Server-reported velocity (court units / server tick, WithNetwork mode only)
+    net_dx: f32,
+    net_dy: f32,
+    /// Client-side smoothed display position (dead reckoning, WithNetwork mode only)
+    render_x: f32,
+    render_y: f32,
 }
 
 #[derive(Debug, PartialEq)]
@@ -83,6 +98,11 @@ pub struct Game {
     /// For network games: which player index (0 or 1) this client controls.
     /// None means local (both paddles controlled locally).
     local_player_index: Option<usize>,
+    /// Set to true when the player presses Space to serve; cleared by App after publishing.
+    pub pending_serve: bool,
+    /// True once the first BallUpdate from the server has been received.
+    /// Prevents rendering the ball at its dummy initial position before server data arrives.
+    has_ball_data: bool,
 }
 
 impl Game {
@@ -95,17 +115,31 @@ impl Game {
         self.local_player_index = Some(index);
     }
 
-    /// Drive the opponent's paddle directly from a network event
-    pub fn set_opponent_paddle(&mut self, player_index: usize, y: u16) {
-        let inner_height = self.game_area.height.saturating_sub(2);
-        let max_y = inner_height.saturating_sub(self.players[player_index].bar_length as u16);
-        self.players[player_index].bar_position = y.min(max_y);
+    /// Drive the opponent's paddle from a network event.
+    /// y_physics is in court units (0 .. COURT_HEIGHT - COURT_PADDLE_HEIGHT = 9).
+    pub fn set_opponent_paddle(&mut self, player_index: usize, y_physics: f32) {
+        let inner_height = self.game_area.height.saturating_sub(2) as f32;
+        if inner_height <= 0.0 { return; }
+        let bar_len = self.players[player_index].bar_length as f32;
+        let max_y = (inner_height - bar_len).max(0.0);
+        // Physics y range: 0 .. (COURT_HEIGHT - COURT_PADDLE_HEIGHT)
+        // Terminal y range: 0 .. max_y
+        let phys_range = (COURT_HEIGHT - COURT_PADDLE_HEIGHT).max(1.0);
+        let terminal_y = (y_physics / phys_range * max_y).clamp(0.0, max_y);
+        self.players[player_index].bar_position = terminal_y as u16;
     }
 
-    /// Set ball position + velocity from the authoritative server
-    pub fn set_ball_from_network(&mut self, x: u16, y: u16, vx: i8, vy: i8) {
-        self.ball.position = [x, y];
-        self.ball.velocity = [vx, vy];
+    /// Store the authoritative ball state from the server (physics/court units).
+    /// Always snaps render_x/y to server truth — the server IS the physics engine.
+    /// No lerp: lerp caused the rendered ball to lag perpetually behind server position.
+    pub fn set_ball_from_network(&mut self, x: f32, y: f32, dx: f32, dy: f32) {
+        self.ball.net_x = x;
+        self.ball.net_y = y;
+        self.ball.net_dx = dx;
+        self.ball.net_dy = dy;
+        self.ball.render_x = x;
+        self.ball.render_y = y;
+        self.has_ball_data = true;
     }
 
     /// Overwrite scores from the server state message
@@ -114,9 +148,14 @@ impl Game {
         self.players[1].score = p2;
     }
 
-    /// Read back the local paddle Y so we can publish it to MQTT
-    pub fn get_paddle_y(&self, player_index: usize) -> u16 {
-        self.players[player_index].bar_position
+    /// Return the local paddle Y in physics/court units (for publishing to server).
+    pub fn get_paddle_physics_y(&self, player_index: usize) -> f32 {
+        let inner_height = self.game_area.height.saturating_sub(2) as f32;
+        let bar_len = self.players[player_index].bar_length as f32;
+        let max_terminal = (inner_height - bar_len).max(1.0);
+        let terminal_y = self.players[player_index].bar_position as f32;
+        // Map terminal position → physics position (0 .. COURT_HEIGHT - COURT_PADDLE_HEIGHT)
+        (terminal_y / max_terminal) * (COURT_HEIGHT - COURT_PADDLE_HEIGHT)
     }
 }
 
@@ -182,6 +221,12 @@ impl Game {
                 ],
                 velocity: [DEFAULT_BALL_VELOCITY_X, DEFAULT_BALL_VELOCITY_Y],
                 is_powered: false,
+                net_x: COURT_WIDTH / 2.0,
+                net_y: COURT_HEIGHT / 2.0,
+                net_dx: 0.0,
+                net_dy: 0.0,
+                render_x: COURT_WIDTH / 2.0,
+                render_y: COURT_HEIGHT / 2.0,
             },
             last_update: Instant::now(),
             game_area: game_area,
@@ -191,6 +236,8 @@ impl Game {
             should_exit: false,
             theme,
             local_player_index: None,
+            pending_serve: false,
+            has_ball_data: false,
         }
     }
 
@@ -249,6 +296,7 @@ impl Game {
                     match code {
                         KeyCode::Up | KeyCode::Char('w') => self.move_player(local_idx, 1),
                         KeyCode::Down | KeyCode::Char('s') => self.move_player(local_idx, -1),
+                        KeyCode::Char(' ') | KeyCode::Enter => self.pending_serve = true,
                         _ => {}
                     }
                 } else {
@@ -268,9 +316,13 @@ impl Game {
     }
 
     fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
+        // Always scroll the local player's paddle.
+        // Previously hardcoded to 0, which meant player-2 clients were accidentally
+        // moving the opponent's (index 0) rendered paddle on their screen.
+        let idx = self.local_player_index.unwrap_or(0);
         match mouse_event.kind {
-            MouseEventKind::ScrollUp => self.move_player(0, 1),
-            MouseEventKind::ScrollDown => self.move_player(0, -1),
+            MouseEventKind::ScrollUp => self.move_player(idx, 1),
+            MouseEventKind::ScrollDown => self.move_player(idx, -1),
             _ => {}
         }
     }
@@ -590,9 +642,16 @@ impl Game {
         let inner_area = Rect::new(
             game_area.x + 1,
             game_area.y + 1,
-            game_area.width - 1,
-            game_area.height - 1,
+            game_area.width.saturating_sub(2),
+            game_area.height.saturating_sub(2),
         );
+
+        // Clear the entire play field every frame.
+        // Ratatui alternates two buffers and never resets them between draws, so
+        // any cell not explicitly written this frame retains its content from
+        // *two frames ago*.  Without this Clear, old ball/paddle positions bleed
+        // back into the terminal diff and appear as ghost objects.
+        frame.render_widget(Clear, inner_area);
 
         // Player 1 bar (left side)
         let player1 = self.get_player(0);
@@ -638,15 +697,29 @@ impl Game {
             .style(Style::default().fg(colors.player_bar).bg(bar_2_color));
         frame.render_widget(bar_2, bar_2_area);
 
-        // Ball
-        let ball_area = Rect::new(
-            inner_area.x + self.ball.position[0],
-            inner_area.y + self.ball.position[1],
-            2,
-            2,
-        );
-        let ball = Paragraph::new("██").style(Style::default().fg(colors.ball));
-        frame.render_widget(ball, ball_area);
+        // Ball — always render. The Clear widget above wipes stale buffer content
+        // each frame, so the phantom-before-server-data problem no longer exists.
+        {
+            let (ball_col, ball_row) = if self.game_type == GameType::WithNetwork {
+                let iw = inner_area.width.saturating_sub(2) as f32;
+                // Server wall-bounce clamps ball Y to [0, COURT_HEIGHT-1].
+                // Map that range to the full inner height (minus 1 for ball height=1).
+                let ih = inner_area.height.saturating_sub(1) as f32;
+                let col = ((self.ball.render_x / COURT_WIDTH) * iw).clamp(0.0, iw) as u16;
+                let row = ((self.ball.render_y / (COURT_HEIGHT - 1.0)) * ih).clamp(0.0, ih) as u16;
+                (col, row)
+            } else {
+                (self.ball.position[0], self.ball.position[1])
+            };
+            let ball_area = Rect::new(
+                inner_area.x + ball_col,
+                inner_area.y + ball_row,
+                2,
+                1,
+            );
+            let ball = Paragraph::new("██").style(Style::default().fg(colors.ball));
+            frame.render_widget(ball, ball_area);
+        }
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -676,8 +749,8 @@ impl Game {
         self.draw_core_elements(frame);
 
         let controls_text = match self.local_player_index {
-            Some(0) => " You are Player 1  |  ↑ / W = up    ↓ / S = down  |  Esc = Quit ",
-            Some(1) => " You are Player 2  |  ↑ / W = up    ↓ / S = down  |  Esc = Quit ",
+            Some(0) => " P1: ↑/W = up  ↓/S = down  Space = serve  |  Esc = Quit ",
+            Some(1) => " P2: ↑/W = up  ↓/S = down  Space = serve  |  Esc = Quit ",
             _ => " Player 1: ↑/↓  |  Player 2: W/S  |  P=Pause  |  Esc=Quit ",
         };
         let controls = Paragraph::new(controls_text)
@@ -746,22 +819,25 @@ impl Game {
             return Ok(true);
         }
 
-        // FPS/speed is relative to difficulty
-        let min_fps = 15.0;
-        let max_fps = 40.0;
-        let fps = min_fps + (max_fps - min_fps) * self.difficulty;
-        let each_frame = (1000.0 / fps).round() as u64;
-
-        if self.last_update.elapsed() >= Duration::from_millis(each_frame) {
+        if self.game_type == GameType::WithNetwork {
+            // Network mode: server owns all ball physics.
+            // Process input every frame — no timer gate. The 40fps timer was built
+            // for local ball physics speed control and has no purpose here; it only
+            // added up to 25ms of input lag on the local paddle.
             self.handle_events()?;
             if self.should_exit {
                 return Ok(false);
             }
+        } else {
+            // ScreenSaver: local physics at difficulty-scaled FPS (15–40 Hz).
+            let fps = 15.0_f32 + 25.0 * self.difficulty;
+            let each_frame = (1000.0 / fps).round() as u64;
 
-            // In network mode the server owns ball physics and opponent paddle.
-            // We only handle local keyboard input (already done above).
-            if self.game_type != GameType::WithNetwork {
-                // ScreenSaver: both paddles are AI
+            if self.last_update.elapsed() >= Duration::from_millis(each_frame) {
+                self.handle_events()?;
+                if self.should_exit {
+                    return Ok(false);
+                }
                 if rand::random() {
                     self.update_computer_player(0);
                     self.update_computer_player(1);
@@ -770,9 +846,8 @@ impl Game {
                     self.update_computer_player(0);
                 }
                 let _ = self.update_ball_position();
+                self.last_update = Instant::now();
             }
-
-            self.last_update = Instant::now();
         }
 
         Ok(true)
