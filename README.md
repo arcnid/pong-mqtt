@@ -25,20 +25,129 @@ Real-time multiplayer pong running in your terminal, powered by MQTT and playabl
 
 ## 🧑‍💻 Getting Started
 
-### Requirements
+### Prerequisites
 
-- Rust (latest stable recommended)
-- A terminal that supports ANSI escape codes (most modern terminals)
+You'll need **Rust** installed to build and run the game. Choose your platform:
 
-### Installation
+<details>
+<summary><b>🍎 macOS</b> (click to expand)</summary>
 
-Clone and build:
+**Option 1: Using Homebrew (recommended)**
+```bash
+# Install Rust via Homebrew
+brew install rust
+
+# Verify installation
+rustc --version
+cargo --version
+```
+
+**Option 2: Using rustup (official installer)**
+```bash
+# Install rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Follow prompts, then reload shell
+source $HOME/.cargo/env
+
+# Verify installation
+cargo --version
+```
+
+</details>
+
+<details>
+<summary><b>🐧 Linux</b> (click to expand)</summary>
+
+**Using rustup (recommended for all distros)**
+```bash
+# Install rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Follow prompts, then reload shell
+source $HOME/.cargo/env
+
+# Verify installation
+cargo --version
+```
+
+**Ubuntu/Debian alternative:**
+```bash
+sudo apt update
+sudo apt install rustc cargo
+```
+
+**Fedora/RHEL alternative:**
+```bash
+sudo dnf install rust cargo
+```
+
+</details>
+
+<details>
+<summary><b>🪟 Windows</b> (click to expand)</summary>
+
+**Option 1: Using Chocolatey**
+```powershell
+# Install Chocolatey first (if not installed):
+# Visit https://chocolatey.org/install
+
+# Install Rust
+choco install rust
+
+# Verify installation
+cargo --version
+```
+
+**Option 2: Using rustup (official installer)**
+1. Download rustup from: https://rustup.rs/
+2. Run `rustup-init.exe`
+3. Follow the installer prompts
+4. Restart your terminal
+5. Verify: `cargo --version`
+
+</details>
+
+---
+
+### Quick Install (Recommended)
+
+**macOS / Linux:**
+```bash
+git clone https://github.com/arcnid/pong-mqtt.git
+cd pong-mqtt
+./install.sh
+```
+
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/arcnid/pong-mqtt.git
+cd pong-mqtt
+.\install.ps1
+```
+
+The install script will:
+- ✅ Check if Rust is installed (installs it if missing)
+- ✅ Build the game in release mode
+- ✅ Show you how to run it
+
+### Manual Installation
+
+If you prefer to do it manually or the install script doesn't work:
 
 ```bash
 git clone https://github.com/arcnid/pong-mqtt.git
 cd pong-mqtt
-cargo run --release
+cargo build --release
 ```
+
+The first build will take a few minutes as it downloads and compiles dependencies. Subsequent runs will be instant.
+
+**Alternative: Download Pre-built Binary** *(coming soon)*
+- [macOS (Apple Silicon)](https://github.com/arcnid/pong-mqtt/releases)
+- [macOS (Intel)](https://github.com/arcnid/pong-mqtt/releases)
+- [Linux (x64)](https://github.com/arcnid/pong-mqtt/releases)
+- [Windows (x64)](https://github.com/arcnid/pong-mqtt/releases)
 
 ### 🎯 How to Play
 
