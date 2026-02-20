@@ -59,6 +59,8 @@ struct App {
     network_status: NetworkStatus,
     network_serve_tx: Option<mpsc::SyncSender<()>>,
     network_restart_tx: Option<mpsc::SyncSender<()>>,
+    network_ready_tx: Option<mpsc::SyncSender<()>>,
+    game_over: bool,  // Track when game ends for overlay UI
 }
 
 #[derive(Debug, PartialEq)]
@@ -98,6 +100,8 @@ impl App {
             network_status: NetworkStatus::Idle,
             network_serve_tx: None,
             network_restart_tx: None,
+            network_ready_tx: None,
+            game_over: false,
         }
     }
 
@@ -137,9 +141,43 @@ impl App {
                         // Drain MQTT events before the game loop tick
                         self.drain_network_events();
 
-                        let continue_game = match self.current_game.as_mut() {
-                            Some(game) => game.game_loop()?,
-                            None => false,
+                        // Handle game over input (Space to ready up)
+                        if self.game_over {
+                            if event::poll(Duration::from_millis(5))? {
+                                if let Event::Key(key_event) = event::read()? {
+                                    if key_event.kind == KeyEventKind::Press {
+                                        match key_event.code {
+                                            KeyCode::Char(' ') | KeyCode::Enter => {
+                                                if let Some(tx) = &self.network_ready_tx {
+                                                    tx.try_send(()).ok();
+                                                }
+                                            }
+                                            KeyCode::Esc => {
+                                                self.current_game = None;
+                                                self.network_rx = None;
+                                                self.network_paddle_tx = None;
+                                                self.network_serve_tx = None;
+                                                self.network_restart_tx = None;
+                                                self.network_ready_tx = None;
+                                                self.game_over = false;
+                                                self.network_status = NetworkStatus::Idle;
+                                                self.screen = AppScreen::MainMenu;
+                                                continue;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let continue_game = if !self.game_over {
+                            match self.current_game.as_mut() {
+                                Some(game) => game.game_loop()?,
+                                None => false,
+                            }
+                        } else {
+                            true  // Don't exit when game over, just show overlay
                         };
 
                         if !continue_game {
@@ -148,6 +186,8 @@ impl App {
                             self.network_paddle_tx = None;
                             self.network_serve_tx = None;
                             self.network_restart_tx = None;
+                            self.network_ready_tx = None;
+                            self.game_over = false;
                             self.network_status = NetworkStatus::Idle;
                             self.screen = AppScreen::MainMenu;
                         } else {
@@ -174,7 +214,13 @@ impl App {
                                 }
                             }
                             if let Some(game) = self.current_game.as_mut() {
-                                let _ = terminal.draw(|frame| game.draw(frame));
+                                let game_over = self.game_over;
+                                let _ = terminal.draw(|frame| {
+                                    game.draw(frame);
+                                    if game_over {
+                                        Self::draw_game_over_overlay(frame, game);
+                                    }
+                                });
                             }
 
                             // Cap the render loop at ~60fps so the terminal isn't flooded
@@ -213,7 +259,7 @@ impl App {
         let vertical_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints(vec![
-                Constraint::Length(12),
+                Constraint::Length(9),
                 Constraint::Length(9),
                 Constraint::Max(5),
             ])
@@ -221,11 +267,10 @@ impl App {
             .split(frame.area());
 
         let big_text = BigText::builder()
-            .pixel_size(PixelSize::Sextant)
-            .style(Style::new().blue())
+            .pixel_size(PixelSize::HalfHeight)
             .lines(vec![
-                "MQTT".cyan().into(),
                 "PONG".white().into(),
+                "MQTT".cyan().into(),
             ])
             .alignment(Alignment::Center)
             .build();
@@ -440,6 +485,39 @@ impl App {
         Ok(())
     }
 
+    fn draw_game_over_overlay(frame: &mut Frame, game: &Game) {
+        use helpers::centered_rect;
+
+        let area = frame.area();
+        let popup_area = centered_rect(50, 12, area.width, area.height);
+
+        // Determine winner
+        let (p1_score, p2_score) = game.get_scores();
+        let winner_text = if p1_score > p2_score {
+            "Player 1 Wins!"
+        } else {
+            "Player 2 Wins!"
+        };
+
+        let text = format!(
+            "{}\n\n{} - {}\n\nPress SPACE to ready up\nEsc to quit",
+            winner_text, p1_score, p2_score
+        );
+
+        let popup = Paragraph::new(text)
+            .block(
+                Block::default()
+                    .title("Game Over")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+            )
+            .style(Style::default().fg(Color::White))
+            .alignment(Alignment::Center);
+
+        frame.render_widget(popup, popup_area);
+    }
+
     fn launch_network_game(&mut self) {
         let game_id = if self.network_game_id.trim().is_empty() {
             "demo".to_string()
@@ -461,6 +539,7 @@ impl App {
         self.network_paddle_tx = Some(handle.paddle_tx);
         self.network_serve_tx = Some(handle.serve_tx);
         self.network_restart_tx = Some(handle.restart_tx);
+        self.network_ready_tx = Some(handle.ready_tx);
 
         let p1_name = if self.network_local_player == 1 { "You" } else { "Opponent" };
         let p2_name = if self.network_local_player == 2 { "You" } else { "Opponent" };
@@ -510,13 +589,11 @@ impl App {
                             if let Some(game) = &mut self.current_game {
                                 game.set_scores(s.p1_score, s.p2_score);
                             }
-                            // If the server says the game is ended (stale session),
-                            // immediately request a restart so the game resets
-                            // without waiting for the 30s server cleanup timeout.
+                            // Track game over state for UI overlay
                             if s.status == network::GameStatus::Ended {
-                                if let Some(tx) = &self.network_restart_tx {
-                                    tx.try_send(()).ok();
-                                }
+                                self.game_over = true;
+                            } else if s.status == network::GameStatus::Playing {
+                                self.game_over = false;
                             }
                         }
                     },

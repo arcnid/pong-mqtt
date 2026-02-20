@@ -148,6 +148,11 @@ impl Game {
         self.players[1].score = p2;
     }
 
+    /// Get current scores (p1, p2)
+    pub fn get_scores(&self) -> (u32, u32) {
+        (self.players[0].score, self.players[1].score)
+    }
+
     /// Return the local paddle Y in physics/court units (for publishing to server).
     pub fn get_paddle_physics_y(&self, player_index: usize) -> f32 {
         let inner_height = self.game_area.height.saturating_sub(2) as f32;

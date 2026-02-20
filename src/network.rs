@@ -95,6 +95,10 @@ impl Topics {
     pub fn restart(&self) -> String {
         format!("pong/game/{}/restart", self.game_id)
     }
+
+    pub fn ready(&self) -> String {
+        format!("pong/game/{}/ready", self.game_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +158,8 @@ pub struct NetworkHandle {
     pub serve_tx: mpsc::SyncSender<()>,
     /// Game loop sends () here to publish a restart message (ignored unless game is ended)
     pub restart_tx: mpsc::SyncSender<()>,
+    /// Game loop sends () here to publish a ready message (post-game restart coordination)
+    pub ready_tx: mpsc::SyncSender<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +171,7 @@ pub fn connect(config: NetworkConfig) -> NetworkHandle {
     let (paddle_tx, paddle_rx) = mpsc::sync_channel::<f32>(32);
     let (serve_tx, serve_rx) = mpsc::sync_channel::<()>(4);
     let (restart_tx, restart_rx) = mpsc::sync_channel::<()>(4);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(4);
 
     thread::spawn(move || {
         let topics = Topics::new(&config.game_id);
@@ -257,6 +264,20 @@ pub fn connect(config: NetworkConfig) -> NetworkHandle {
             }
         });
 
+        // Spawn a sub-thread to forward ready signals (post-game restart coordination)
+        let ready_client = client.clone();
+        let ready_topic = topics.ready();
+        let player_num2 = config.player;
+        thread::spawn(move || {
+            while let Ok(()) = ready_rx.recv() {
+                #[derive(serde::Serialize)]
+                struct ReadyMsg { player: u8, timestamp: u64 }
+                if let Ok(payload) = serde_json::to_vec(&ReadyMsg { player: player_num2, timestamp: now_ms() }) {
+                    ready_client.publish(&ready_topic, QoS::AtMostOnce, false, payload).ok();
+                }
+            }
+        });
+
         // Main event loop for incoming MQTT messages
         for notification in connection.iter() {
             match notification {
@@ -294,6 +315,7 @@ pub fn connect(config: NetworkConfig) -> NetworkHandle {
         paddle_tx,
         serve_tx,
         restart_tx,
+        ready_tx,
     }
 }
 
